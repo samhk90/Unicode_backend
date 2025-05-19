@@ -10,7 +10,7 @@ from django.db import models
 from .models import Teacher, Timetable, Student, Slots, Attendance, Classes, Subject, TeacherSubjectAssignment
 from django.core.cache import cache
 from django.db.models import Prefetch, F, Count, Q
-from django.conf import settings
+
 from django.utils import timezone
 import os
 from datetime import datetime, timedelta
@@ -450,7 +450,7 @@ def submit_attendance(request):
 @api_view(['GET'])
 def get_attendance_report(request):
     try:
-        class_id = request.GET.get('class_id')
+        class_id = request.GET.get('classId')
         report_type = request.GET.get('report_type')
         subject_id = request.GET.get('subject_id')
         date_param = request.GET.get('date')
@@ -461,6 +461,43 @@ def get_attendance_report(request):
             return Response({
                 'error': 'class_id is required'
             }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Initialize date range based on report type
+        date_range = None
+        if report_type == 'daily':
+            if not date_param:
+                return Response({
+                    'error': 'date is required for daily report'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            date_range = (date_param, date_param)
+            
+        elif report_type == 'weekly':
+            if not date_param:
+                return Response({
+                    'error': 'date is required for weekly report'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            date_obj = datetime.strptime(date_param, '%Y-%m-%d')
+            start_of_week = date_obj - timedelta(days=date_obj.weekday())
+            end_of_week = start_of_week + timedelta(days=6)
+            date_range = (start_of_week.strftime('%Y-%m-%d'), end_of_week.strftime('%Y-%m-%d'))
+            
+        elif report_type == 'monthly':
+            if not date_param:
+                return Response({
+                    'error': 'date is required for monthly report'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            date_obj = datetime.strptime(date_param, '%Y-%m-%d')
+            _, last_day = calendar.monthrange(date_obj.year, date_obj.month)
+            start_of_month = date_obj.replace(day=1)
+            end_of_month = date_obj.replace(day=last_day)
+            date_range = (start_of_month.strftime('%Y-%m-%d'), end_of_month.strftime('%Y-%m-%d'))
+            
+        elif report_type == 'custom':
+            if not start_date or not end_date:
+                return Response({
+                    'error': 'start_date and end_date are required for custom report'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            date_range = (start_date, end_date)
 
         # Base query with all necessary joins
         base_query = (
@@ -473,83 +510,80 @@ def get_attendance_report(request):
             .filter(ClassID_id=class_id)
         )
 
-        # Apply filters based on report type
-        if report_type == 'daily':
-            if not date_param:
-                return Response({
-                    'error': 'date is required for daily report'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            base_query = base_query.filter(Date=date_param)
-            
-        elif report_type == 'weekly':
-            if not date_param:
-                return Response({
-                    'error': 'date is required for weekly report'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            date_obj = datetime.strptime(date_param, '%Y-%m-%d')
-            start_of_week = date_obj - timedelta(days=date_obj.weekday())
-            end_of_week = start_of_week + timedelta(days=6)
-            base_query = base_query.filter(Date__range=[start_of_week, end_of_week])
-            
-        elif report_type == 'monthly':
-            if not date_param:
-                return Response({
-                    'error': 'date is required for monthly report'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            date_obj = datetime.strptime(date_param, '%Y-%m-%d')
-            _, last_day = calendar.monthrange(date_obj.year, date_obj.month)
-            start_of_month = date_obj.replace(day=1)
-            end_of_month = date_obj.replace(day=last_day)
-            base_query = base_query.filter(Date__range=[start_of_month, end_of_month])
-            
-        elif report_type == 'subject-wise':
-            if not subject_id:
-                return Response({
-                    'error': 'subject_id is required for subject-wise report'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            base_query = base_query.filter(SubjectID_id=subject_id)
-            
-        elif report_type == 'custom':
-            if not start_date or not end_date:
-                return Response({
-                    'error': 'start_date and end_date are required for custom report'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            base_query = base_query.filter(Date__range=[start_date, end_date])
+        # Apply date range filter
+        if date_range:
+            base_query = base_query.filter(Date__range=date_range)
 
-        # Get attendance records and aggregate data
-        attendance_data = []
+        # Apply subject filter if provided
+        if subject_id:
+            base_query = base_query.filter(SubjectID_id=subject_id)
+
+        # Get all students in the class
         students = Student.objects.filter(CurrentClassID_id=class_id).order_by('RollNumber')
         
-        for student in students:
-            student_attendance = base_query.filter(StudentID=student)
-            total_classes = student_attendance.count()
-            present_classes = student_attendance.filter(Status=True).count()
-            attendance_percentage = (present_classes / total_classes * 100) if total_classes > 0 else 0
-            
-            attendance_data.append({
-                'student_id': str(student.StudentID),
-                'roll_number': student.RollNumber,
-                'name': f"{student.FirstName} {student.LastName}",
-                'total_classes': total_classes,
-                'present_classes': present_classes,
-                'absent_classes': total_classes - present_classes,
-                'attendance_percentage': round(attendance_percentage, 2)
-            })
+        # Get the total number of days in the date range for calculating percentages
+        total_days = len(set(base_query.values_list('Date', flat=True)))
+        if total_days == 0:
+            return Response({
+                'error': 'No attendance records found for the specified date range'
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        attendance_data = []
+        if report_type == 'daily':
+            # For daily report, just show present/absent status for that day
+            for student in students:
+                student_attendance = base_query.filter(StudentID=student).first()
+                attendance_data.append({
+                    'student_id': str(student.StudentID),
+                    'roll_number': student.RollNumber,
+                    'name': f"{student.FirstName} {student.LastName}",
+                    'status': 'Present' if (student_attendance and student_attendance.Status) else 'Absent'
+                })
+        else:
+            # For weekly/monthly/custom reports, show attendance statistics
+            for student in students:
+                student_attendance = base_query.filter(StudentID=student)
+                present_days = student_attendance.filter(Status=True).count()
+                total_classes = student_attendance.count()
+                
+                # Calculate attendance percentage based on actual days present
+                attendance_percentage = (present_days / total_days * 100) if total_days > 0 else 0
+                
+                attendance_data.append({
+                    'student_id': str(student.StudentID),
+                    'roll_number': student.RollNumber,
+                    'name': f"{student.FirstName} {student.LastName}",
+                    'total_classes': total_classes,
+                    'present_days': present_days,
+                    'absent_days': total_days - present_days,
+                    'attendance_percentage': round(attendance_percentage, 2)
+                })
 
         # Calculate class-wide statistics
         total_students = len(attendance_data)
-        avg_attendance = sum(d['attendance_percentage'] for d in attendance_data) / total_students if total_students > 0 else 0
-        
+        if report_type == 'daily':
+            present_students = sum(1 for d in attendance_data if d['status'] == 'Present')
+            absent_students = total_students - present_students
+            avg_attendance = (present_students / total_students * 100) if total_students > 0 else 0
+        else:
+            avg_attendance = sum(d['attendance_percentage'] for d in attendance_data) / total_students if total_students > 0 else 0
+            threshold = 75  # Students with attendance >= 75% are considered regular
+            present_students = sum(1 for d in attendance_data if d['attendance_percentage'] >= threshold)
+            absent_students = total_students - present_students
+
         response_data = {
             'report_type': report_type,
             'class_name': Classes.objects.get(ClassID=class_id).ClassName,
             'date_range': {
-                'start': start_date or date_param,
-                'end': end_date or date_param
+                'start': date_range[0] if date_range else None,
+                'end': date_range[1] if date_range else None
             },
+            'total_days': total_days,
             'statistics': {
                 'total_students': total_students,
-                'average_attendance': round(avg_attendance, 2)
+                'average_attendance': round(avg_attendance, 2),
+                'present_students': present_students,
+                'absent_students': absent_students
             },
             'attendance_data': attendance_data
         }
@@ -622,10 +656,8 @@ def get_teacher_subjects(request):
                 }
             })
 
-        return Response({
-            'message': 'Teacher subjects fetched successfully',
-            'data': subject_data
-        }, status=status.HTTP_200_OK)
+        return Response(subject_data,
+         status=status.HTTP_200_OK)
 
     except Exception as e:
         return Response({
@@ -687,5 +719,362 @@ def get_department_classes(request):
         return Response({
             'error': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET'])
+def get_daily_attendance(request):
+    try:
+        class_id = request.GET.get('classId')
+        subject_id = request.GET.get('subject_id')
+        date = request.GET.get('date')
+        
+        if not all([class_id, date]):
+            return Response({'error': 'classId and date are required'}, 
+                          status=status.HTTP_400_BAD_REQUEST)
+
+        base_query = (
+            Attendance.objects
+            .select_related('StudentID', 'SubjectID')
+            .filter(ClassID_id=class_id, Date=date)
+        )
+
+        if subject_id:
+            base_query = base_query.filter(SubjectID_id=subject_id)
+
+        students = Student.objects.filter(CurrentClassID_id=class_id).order_by('RollNumber')
+        
+        attendance_data = []
+        for student in students:
+            student_attendance = base_query.filter(StudentID=student).first()
+            attendance_data.append({
+                'rollNo': student.RollNumber,
+                'name': f"{student.FirstName} {student.LastName}",
+                'status': 'Present' if (student_attendance and student_attendance.Status) else 'Absent'
+            })
+
+        present_count = sum(1 for d in attendance_data if d['status'] == 'Present')
+        total_students = len(attendance_data)
+        
+        return Response({
+            'date': date,
+            'class': Classes.objects.get(ClassID=class_id).ClassName,
+            'subject': Subject.objects.get(SubjectID=subject_id).SubjectName if subject_id else None,
+            'stats': {
+                'present': present_count,
+                'absent': total_students - present_count,
+                'total': total_students
+            },
+            'students': attendance_data
+        })
+        
+    except Exception as e:
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET'])
+def get_weekly_attendance(request):
+    try:
+        class_id = request.GET.get('classId')
+        subject_id = request.GET.get('subject_id')
+        date = request.GET.get('date')
+        
+        if not all([class_id, date]):
+            return Response({'error': 'classId and date are required'}, 
+                          status=status.HTTP_400_BAD_REQUEST)
+
+        date_obj = datetime.strptime(date, '%Y-%m-%d')
+        start_date = date_obj - timedelta(days=date_obj.weekday())
+        end_date = start_date + timedelta(days=6)
+        
+        base_query = (
+            Attendance.objects
+            .select_related('StudentID', 'SubjectID')
+            .filter(
+                ClassID_id=class_id,
+                Date__range=[start_date.strftime('%Y-%m-%d'), 
+                            end_date.strftime('%Y-%m-%d')]
+            )
+        )
+
+        if subject_id:
+            base_query = base_query.filter(SubjectID_id=subject_id)
+
+        # Get actual number of working days in the week
+        total_days = len(set(base_query.values_list('Date', flat=True)))
+        if total_days == 0:
+            return Response({'error': 'No attendance records found for this week'}, 
+                          status=status.HTTP_404_NOT_FOUND)
+
+        students = Student.objects.filter(CurrentClassID_id=class_id).order_by('RollNumber')
+        weekly_data = []
+        
+        for student in students:
+            student_attendance = base_query.filter(StudentID=student)
+            present_days = student_attendance.filter(Status=True).count()
+            # Ensure present_days doesn't exceed total_days
+            present_days = min(present_days, total_days)
+            # Calculate absent days ensuring it's not negative
+            absent_days = total_days - present_days
+            # Calculate percentage capped at 100%
+            attendance_percentage = min((present_days / total_days * 100), 100) if total_days > 0 else 0
+            
+            weekly_data.append({
+                'rollNo': student.RollNumber,
+                'name': f"{student.FirstName} {student.LastName}",
+                'totalDays': total_days,
+                'presentDays': present_days,
+                'absentDays': absent_days,
+                'percentage': round(attendance_percentage, 2)
+            })
+
+        # Calculate class statistics
+        total_students = len(weekly_data)
+        present_count = sum(d['presentDays'] for d in weekly_data)
+        total_possible = total_students * total_days
+        class_percentage = min((present_count / total_possible * 100), 100) if total_possible > 0 else 0
+
+        return Response({
+            'week': {
+                'start': start_date.strftime('%Y-%m-%d'),
+                'end': end_date.strftime('%Y-%m-%d'),
+                'totalDays': total_days
+            },
+            'class': Classes.objects.get(ClassID=class_id).ClassName,
+            'subject': Subject.objects.get(SubjectID=subject_id).SubjectName if subject_id else None,
+            'summary': {
+                'totalStudents': total_students,
+                'averageAttendance': round(class_percentage, 2)
+            },
+            'weeklyStats': weekly_data
+        })
+        
+    except Exception as e:
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET'])
+def get_monthly_attendance(request):
+    try:
+        class_id = request.GET.get('classId')
+        subject_id = request.GET.get('subject_id')
+        date = request.GET.get('date')
+        
+        if not all([class_id, date]):
+            return Response({'error': 'classId and date are required'}, 
+                          status=status.HTTP_400_BAD_REQUEST)
+
+        # Calculate month range
+        date_obj = datetime.strptime(date, '%Y-%m-%d')
+        _, last_day = calendar.monthrange(date_obj.year, date_obj.month)
+        start_date = date_obj.replace(day=1)
+        end_date = date_obj.replace(day=last_day)
+        
+        base_query = (
+            Attendance.objects
+            .select_related('StudentID', 'SubjectID')
+            .filter(
+                ClassID_id=class_id,
+                Date__range=[start_date.strftime('%Y-%m-%d'), 
+                            end_date.strftime('%Y-%m-%d')]
+            )
+        )
+
+        if subject_id:
+            base_query = base_query.filter(SubjectID_id=subject_id)
+
+        # Get total number of working days
+        total_days = len(set(base_query.values_list('Date', flat=True)))
+        if total_days == 0:
+            return Response({'error': 'No attendance records found for this month'}, 
+                          status=status.HTTP_404_NOT_FOUND)
+
+        students = Student.objects.filter(CurrentClassID_id=class_id).order_by('RollNumber')
+        monthly_data = []
+        
+        for student in students:
+            student_attendance = base_query.filter(StudentID=student)
+            present_days = student_attendance.filter(Status=True).count()
+            # Ensure present_days doesn't exceed total_days
+            present_days = min(present_days, total_days)
+            # Calculate absent days ensuring it's not negative
+            absent_days = total_days - present_days
+            # Calculate percentage capped at 100%
+            attendance_percentage = min((present_days / total_days * 100), 100) if total_days > 0 else 0
+            
+            monthly_data.append({
+                'rollNo': student.RollNumber,
+                'name': f"{student.FirstName} {student.LastName}",
+                'totalDays': total_days,
+                'presentDays': present_days,
+                'absentDays': absent_days,
+                'percentage': round(attendance_percentage, 2)
+            })
+
+        # Calculate class statistics
+        total_students = len(monthly_data)
+        present_count = sum(d['presentDays'] for d in monthly_data)
+        total_possible = total_students * total_days
+        class_percentage = min((present_count / total_possible * 100), 100) if total_possible > 0 else 0
+        below_threshold = sum(1 for d in monthly_data if d['percentage'] < 75)
+
+        return Response({
+            'month': {
+                'start': start_date.strftime('%Y-%m-%d'),
+                'end': end_date.strftime('%Y-%m-%d'),
+                'totalDays': total_days
+            },
+            'class': Classes.objects.get(ClassID=class_id).ClassName,
+            'subject': Subject.objects.get(SubjectID=subject_id).SubjectName if subject_id else None,
+            'summary': {
+                'totalStudents': total_students,
+                'averageAttendance': round(class_percentage, 2),
+                'belowThreshold': below_threshold
+            },
+            'monthlyStats': monthly_data
+        })
+        
+    except Exception as e:
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET'])
+def get_custom_attendance(request):
+    try:
+        class_id = request.GET.get('classId')
+        subject_id = request.GET.get('subject_id')
+        start_date = request.GET.get('start_date')
+        end_date = request.GET.get('end_date')
+        
+        if not all([class_id, start_date, end_date]):
+            return Response({'error': 'classId, start_date and end_date are required'}, 
+                          status=status.HTTP_400_BAD_REQUEST)
+
+        base_query = (
+            Attendance.objects
+            .select_related('StudentID', 'SubjectID')
+            .filter(
+                ClassID_id=class_id,
+                Date__range=[start_date, end_date]
+            )
+        )
+
+        if subject_id:
+            base_query = base_query.filter(SubjectID_id=subject_id)
+
+        # Get actual number of working days in the date range
+        total_days = len(set(base_query.values_list('Date', flat=True)))
+        if total_days == 0:
+            return Response({'error': 'No attendance records found'}, 
+                          status=status.HTTP_404_NOT_FOUND)
+
+        students = Student.objects.filter(CurrentClassID_id=class_id).order_by('RollNumber')
+        custom_data = []
+        
+        for student in students:
+            student_attendance = base_query.filter(StudentID=student)
+            present_days = student_attendance.filter(Status=True).count()
+            # Ensure present_days doesn't exceed total_days
+            present_days = min(present_days, total_days)
+            # Calculate absent days ensuring it's not negative
+            absent_days = total_days - present_days
+            # Calculate percentage capped at 100%
+            attendance_percentage = min((present_days / total_days * 100), 100) if total_days > 0 else 0
+            
+            custom_data.append({
+                'rollNo': student.RollNumber,
+                'name': f"{student.FirstName} {student.LastName}",
+                'totalDays': total_days,
+                'presentDays': present_days,
+                'absentDays': absent_days,
+                'percentage': round(attendance_percentage, 2)
+            })
+
+        # Calculate class statistics
+        total_students = len(custom_data)
+        present_count = sum(d['presentDays'] for d in custom_data)
+        total_possible = total_students * total_days
+        class_percentage = min((present_count / total_possible * 100), 100) if total_possible > 0 else 0
+        below_threshold = sum(1 for d in custom_data if d['percentage'] < 75)
+
+        return Response({
+            'dateRange': {
+                'start': start_date,
+                'end': end_date,
+                'totalDays': total_days
+            },
+            'class': Classes.objects.get(ClassID=class_id).ClassName,
+            'subject': Subject.objects.get(SubjectID=subject_id).SubjectName if subject_id else None,
+            'summary': {
+                'totalStudents': total_students,
+                'averageAttendance': round(class_percentage, 2),
+                'belowThreshold': below_threshold
+            },
+            'studentStats': custom_data
+        })
+        
+    except Exception as e:
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET'])
+def get_subject_attendance(request):
+    try:
+        class_id = request.GET.get('classId')
+        subject_id = request.GET.get('subject_id')
+        if not all([class_id, subject_id]):
+            return Response({'error': 'classId, subject_id, and date are required'}, 
+                          status=status.HTTP_400_BAD_REQUEST)
+
+        base_query = (
+            Attendance.objects
+            .select_related('StudentID')
+            .filter(
+                ClassID_id=class_id, 
+                SubjectID_id=subject_id
+            )
+        )
+
+        total_lectures = len(set(base_query.values_list('Date', flat=True)))
+        if total_lectures == 0:
+            return Response({'error': 'No attendance records found for this month'}, 
+                          status=status.HTTP_404_NOT_FOUND)
+
+        students = Student.objects.filter(CurrentClassID_id=class_id).order_by('RollNumber')
+        
+        monthly_data = []
+        for student in students:
+            student_attendance = base_query.filter(StudentID=student)
+            present_count = student_attendance.filter(Status=True).count()
+            # Ensure present_count doesn't exceed total_lectures
+            present_count = min(present_count, total_lectures)
+            # Calculate percentage capped at 100%
+            attendance_percentage = min((present_count / total_lectures * 100), 100) if total_lectures > 0 else 0
+            
+            monthly_data.append({
+                'rollNo': student.RollNumber,
+                'name': f"{student.FirstName} {student.LastName}",
+                'totalLectures': total_lectures,
+                'attended': present_count,
+                'absent': total_lectures - present_count,
+                'percentage': round(attendance_percentage, 2)
+            })
+
+        # Calculate overall statistics
+        total_students = len(monthly_data)
+        total_attendance = sum(d['attended'] for d in monthly_data)
+        max_possible = total_students * total_lectures
+        overall_percentage = min((total_attendance / max_possible * 100), 100) if max_possible > 0 else 0
+        below_threshold = sum(1 for d in monthly_data if d['percentage'] < 75)
+
+        return Response({
+
+            'class': Classes.objects.get(ClassID=class_id).ClassName,
+            'subject': Subject.objects.get(SubjectID=subject_id).SubjectName,
+            'totalLectures': total_lectures,
+            'overallStats': {
+                'totalStudents': total_students,
+                'averageAttendance': round(overall_percentage, 2),
+                'belowThreshold': below_threshold
+            },
+            'studentStats': monthly_data
+        })
+        
+    except Exception as e:
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
