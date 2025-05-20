@@ -17,5 +17,7 @@ urlpatterns = [
     path('attendance/subject/', views.get_subject_attendance, name='subject_attendance'),
     path('attendance/custom/', views.get_custom_attendance, name='custom_attendance'),
     path('attendance/monthly/', views.get_monthly_attendance, name='monthly_attendance'),
-
+    path('notices/', views.notices, name='notices'),
+    path('notices/<int:notice_id>/delete/', views.delete_notice, name='delete_notice'),
+    path('notices/<int:notice_id>/publish/', views.publish_notice, name='publish_notice'),
 ]

@@ -123,14 +123,6 @@ class Attendance(models.Model):
     Timefrom= models.CharField(max_length=50, default='DEFAULT_TIME')
     SlotID = models.ForeignKey('Slots', on_delete=models.CASCADE,default=1)
     Status = models.BooleanField(max_length=50)
-class Notices(models.Model):
-    id = models.AutoField(primary_key=True)
-    title = models.CharField(max_length=100)    
-    teacherpublished = models.ForeignKey('Teacher',on_delete=models.CASCADE,default=uuid.UUID('45d8c03d-0e93-48a7-b036-41ad381b7233')
-    )
-    ClassID = models.ForeignKey('Classes', on_delete=models.CASCADE)
-    date = models.DateField()
-    attachment = models.ImageField(max_length=500,null=True, blank=True)
 class Fees(models.Model):
     FeeID = models.AutoField(primary_key=True)
     TotalAmount = models.DecimalField(max_digits=10, decimal_places=2)
@@ -247,3 +239,26 @@ class TempTimetable(models.Model):
 
     def __str__(self):
         return f"{self.LeaveRequestID} - {self.ClassID} - {self.Date} - {self.SlotID}"
+class Notice(models.Model):
+
+    STATUS_CHOICES = [
+        ('DRAFT', 'Draft'),
+        ('PUBLISHED', 'Published'),
+    ]
+
+    title = models.CharField(max_length=255)
+    content = models.TextField()
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='DRAFT')
+    publish_date = models.DateTimeField(auto_now_add=True)
+    last_modified = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(Teacher, on_delete=models.CASCADE)
+    class_id = models.ForeignKey('Classes', on_delete=models.CASCADE, null=True, blank=True,default=3)  # Allow null for notices that apply to all classes
+
+    class Meta:
+        ordering = ['-publish_date']
+
+class NoticeDocument(models.Model):
+    notice = models.ForeignKey(Notice, related_name='documents', on_delete=models.CASCADE)
+    name = models.CharField(max_length=255)
+    file_path = models.CharField(max_length=1000)
+    uploaded_at = models.DateTimeField(auto_now_add=True)

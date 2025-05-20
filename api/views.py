@@ -7,7 +7,7 @@ from django.contrib.auth import authenticate, login as auth_login
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 from django.db import models
-from .models import Teacher, Timetable, Student, Slots, Attendance, Classes, Subject, TeacherSubjectAssignment
+from .models import Teacher, Timetable, Student, Slots, Attendance, Classes, Subject, TeacherSubjectAssignment, Notice, NoticeDocument
 from django.core.cache import cache
 from django.db.models import Prefetch, F, Count, Q
 
@@ -1076,5 +1076,165 @@ def get_subject_attendance(request):
         
     except Exception as e:
         return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET', 'POST'])
+def notices(request):
+    if request.method == 'GET':
+        try:
+            # Get query parameters
+            search_query = request.GET.get('search')
+            class_id = request.GET.get('class_id')
+            teacher_id = request.GET.get('teacher_id')  # Added teacher_id parameter
+            
+            if not teacher_id:
+                return Response({
+                    'error': 'teacher_id is required'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            try:
+                # Get teacher's department
+                teacher = Teacher.objects.select_related('DepartmentID').get(Teacherid=teacher_id)
+                teacher_department = teacher.DepartmentID
+            except Teacher.DoesNotExist:
+                return Response({
+                    'error': 'Teacher not found'
+                }, status=status.HTTP_404_NOT_FOUND)
+            
+            # Start with all notices, ordered by publish date
+            notices_query = Notice.objects.select_related(
+                'created_by', 
+                'class_id',
+                'class_id__DepartmentID',
+                'created_by__DepartmentID'
+            ).prefetch_related('documents')
+            
+            # Filter notices by department
+            notices_query = notices_query.filter(
+                Q(class_id__DepartmentID=teacher_department) |  # Notices for classes in teacher's department
+                Q(created_by__DepartmentID=teacher_department)  # Notices created by teachers in same department
+            )
+            
+            if search_query:
+                notices_query = notices_query.filter(
+                    Q(title__icontains=search_query) | 
+                    Q(content__icontains=search_query)
+                )
+            
+            if class_id:
+                notices_query = notices_query.filter(
+                    Q(class_id_id=class_id) | Q(class_id__isnull=True)
+                )
+            
+            # Convert to list of dictionaries
+            notices_data = []
+            for notice in notices_query:
+                notices_data.append({
+                    'id': notice.id,
+                    'title': notice.title,
+                    'content': notice.content,
+                    'status': notice.status,
+                    'publishDate': notice.publish_date,
+                    'created_by': f"{notice.created_by.FirstName} {notice.created_by.LastName}",
+                    'department': notice.created_by.DepartmentID.DepartmentName,
+                    'class_name': notice.class_id.ClassName if notice.class_id else 'All Classes',
+                    'class_id': notice.class_id.ClassID if notice.class_id else None,
+                    'class_department': notice.class_id.DepartmentID.DepartmentName if notice.class_id else None,
+                    'documents': [
+                        {
+                            'id': doc.id,
+                            'name': doc.name,
+                            'path': doc.file_path
+                        } for doc in notice.documents.all()
+                    ]
+                })
+            
+            return Response({
+                'message': 'Notices fetched successfully',
+                'teacher_department': teacher_department.DepartmentName,
+                'data': notices_data
+            }, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            return Response({
+                'error': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    elif request.method == 'POST':
+        try:
+            teacher_id = request.data.get('teacher_id')
+            class_id = request.data.get('class_id')  # New parameter
+            
+            if not teacher_id:
+                return Response({
+                    'error': 'teacher_id is required'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Create notice
+            notice = Notice.objects.create(
+                title=request.data.get('title'),
+                content=request.data.get('content'),
+                created_by_id=teacher_id,
+                class_id_id=class_id  # Will be None if not provided
+            )
+            
+            # Handle documents
+            documents = request.data.get('documents', [])
+            for doc in documents:
+                NoticeDocument.objects.create(
+                    notice=notice,
+                    name=doc.get('name'),
+                    file_path=doc.get('path')
+                )
+            
+            return Response({
+                'message': 'Notice created successfully',
+                'data': {
+                    'id': notice.id,
+                    'title': notice.title,
+                    'status': notice.status,
+                    'class_name': notice.class_id.ClassName if notice.class_id else 'All Classes'
+                }
+            }, status=status.HTTP_201_CREATED)
+            
+        except Exception as e:
+            return Response({
+                'error': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['DELETE'])
+def delete_notice(request, notice_id):
+    try:
+        notice = Notice.objects.get(id=notice_id)
+        notice.delete()
+        return Response({
+            'message': 'Notice deleted successfully'
+        }, status=status.HTTP_200_OK)
+    except Notice.DoesNotExist:
+        return Response({
+            'error': 'Notice not found'
+        }, status=status.HTTP_404_NOT_FOUND)
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['PUT'])
+def publish_notice(request, notice_id):
+    try:
+        notice = Notice.objects.get(id=notice_id)
+        notice.status = 'PUBLISHED'
+        notice.save()
+        return Response({
+            'message': 'Notice published successfully'
+        }, status=status.HTTP_200_OK)
+    except Notice.DoesNotExist:
+        return Response({
+            'error': 'Notice not found'
+        }, status=status.HTTP_404_NOT_FOUND)
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 
