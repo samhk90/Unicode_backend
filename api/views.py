@@ -7,9 +7,9 @@ from django.contrib.auth import authenticate, login as auth_login
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 from django.db import models
-from .models import Teacher, Timetable, Student, Slots, Attendance, Classes, Subject, TeacherSubjectAssignment, Notice, NoticeDocument
+from .models import Teacher, Timetable, Student, Slots, Attendance, Classes, Subject, TeacherSubjectAssignment, Notice, NoticeDocument, Results
 from django.core.cache import cache
-from django.db.models import Prefetch, F, Count, Q
+from django.db.models import Prefetch, F, Count, Q, Avg  # Added Avg import
 
 from django.utils import timezone
 import os
@@ -1142,7 +1142,7 @@ def notices(request):
                     'documents': [
                         {
                             'id': doc.id,
-                            'name': doc.name,
+                            'name': doc.file_path.split('/')[-1],  # Just the file name
                             'path': doc.file_path
                         } for doc in notice.documents.all()
                     ]
@@ -1231,6 +1231,133 @@ def publish_notice(request, notice_id):
         return Response({
             'error': 'Notice not found'
         }, status=status.HTTP_404_NOT_FOUND)
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET'])
+def get_class_report(request):
+    try:
+        class_id = request.GET.get('class_id')
+        if not class_id:
+            return Response({
+                'error': 'class_id is required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Get class information with related fields
+        try:
+            class_obj = Classes.objects.select_related(
+                'DepartmentID',
+                'YearID'
+            ).get(ClassID=class_id)
+        except Classes.DoesNotExist:
+            return Response({
+                'error': 'Class not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        # Get all students in the class
+        students = Student.objects.filter(CurrentClassID=class_id).order_by('RollNumber')
+        total_students = students.count()
+
+        # Get subject information
+        subjects = Subject.objects.filter(CurrentClassID=class_id)
+        
+        # Get attendance statistics - Using AttendanceID instead of id
+        attendance_stats = (
+            Attendance.objects
+            .filter(ClassID=class_id)
+            .values('StudentID')
+            .annotate(
+                total_classes=Count('AttendanceID'),
+                present_count=Count('AttendanceID', filter=Q(Status=True))
+            )
+        )
+
+        # Calculate overall attendance
+        total_attendance = sum(stat['present_count'] for stat in attendance_stats)
+        total_possible = sum(stat['total_classes'] for stat in attendance_stats)
+        overall_attendance = (total_attendance / total_possible * 100) if total_possible > 0 else 0
+
+        # Calculate subject-wise performance
+        subject_stats = []
+        for subject in subjects:
+            subject_attendance = (
+                Attendance.objects
+                .filter(ClassID=class_id, SubjectID=subject)
+                .values('StudentID')
+                .annotate(
+                    total_classes=Count('AttendanceID'),
+                    present_count=Count('AttendanceID', filter=Q(Status=True))
+                )
+            )
+            
+            total_sub_attendance = sum(stat['present_count'] for stat in subject_attendance)
+            total_sub_possible = sum(stat['total_classes'] for stat in subject_attendance)
+            subject_attendance_percent = (total_sub_attendance / total_sub_possible * 100) if total_sub_possible > 0 else 0
+
+            # Get results for this subject if available
+            results = Results.objects.filter(SubjectID=subject)
+            avg_marks = results.aggregate(Avg('Marks'))['Marks__avg'] or 0
+
+            subject_stats.append({
+                'subject_name': subject.SubjectName,
+                'subject_type': 'Theory' if subject.SubjectType else 'Practical',
+                'attendance_percentage': round(subject_attendance_percent, 2),
+                'average_marks': round(avg_marks, 2),
+                'total_lectures': total_sub_possible
+            })
+
+        # Get student-wise performance
+        student_stats = []
+        for student in students:
+            # Get student's attendance
+            student_attendance = next(
+                (stat for stat in attendance_stats if str(stat['StudentID']) == str(student.StudentID)),
+                {'total_classes': 0, 'present_count': 0}
+            )
+            
+            attendance_percent = (
+                student_attendance['present_count'] / student_attendance['total_classes'] * 100
+            ) if student_attendance['total_classes'] > 0 else 0
+
+            # Get student's results
+            results = Results.objects.filter(StudentID=student)
+            avg_marks = results.aggregate(Avg('Marks'))['Marks__avg'] or 0
+
+            student_stats.append({
+                'roll_number': student.RollNumber,
+                'name': f"{student.FirstName} {student.LastName}",
+                'attendance_percentage': round(attendance_percent, 2),
+                'average_marks': round(avg_marks, 2)
+            })
+
+        # Prepare response data
+        response_data = {
+            'class_info': {
+                'class_name': class_obj.ClassName,
+                'department': class_obj.DepartmentID.DepartmentName,
+                'year': class_obj.YearID.YearName,
+                'total_students': total_students,
+            },
+            'overall_statistics': {
+                'overall_attendance': round(overall_attendance, 2),
+                'total_subjects': subjects.count(),
+                'average_class_performance': round(
+                    sum(stat['average_marks'] for stat in subject_stats) / len(subject_stats)
+                    if subject_stats else 0,
+                    2
+                )
+            },
+            'subject_statistics': subject_stats,
+            'student_statistics': student_stats
+        }
+
+        return Response({
+            'message': 'Class report generated successfully',
+            'data': response_data
+        }, status=status.HTTP_200_OK)
+
     except Exception as e:
         return Response({
             'error': str(e)
