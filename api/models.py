@@ -2,6 +2,12 @@ from django.db import models
 import uuid
 from django.db import models
 from django.utils import timezone
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+from datetime import datetime, date
+
+def get_current_year():
+    return datetime.now().year
 
 class Year(models.Model):
     YearID = models.AutoField(primary_key=True)
@@ -205,6 +211,10 @@ class LeaveType(models.Model):
     LeaveTypeID = models.AutoField(primary_key=True)
     LeaveTypeName = models.CharField(max_length=100)
     Description = models.TextField(blank=True, null=True)
+    default_allocation = models.PositiveIntegerField(default=0)
+
+    def __str__(self):
+        return self.LeaveTypeName
 
 class LeaveRequest(models.Model):
     LeaveRequestID = models.AutoField(primary_key=True)
@@ -262,3 +272,26 @@ class NoticeDocument(models.Model):
     name = models.CharField(max_length=255)
     file_path = models.CharField(max_length=1000)
     uploaded_at = models.DateTimeField(auto_now_add=True)
+class TeacherLeaveBalance(models.Model):
+    leave_balance_id = models.AutoField(primary_key=True)
+    employee = models.ForeignKey('Teacher', on_delete=models.CASCADE, related_name='leave_balances')
+    leave_type = models.ForeignKey(LeaveType, on_delete=models.CASCADE)
+    allocated = models.DecimalField(max_digits=5, decimal_places=1, default=0)
+    used = models.DecimalField(max_digits=5, decimal_places=1, default=0)
+    year = models.IntegerField(default=get_current_year)
+    last_updated = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ['employee', 'leave_type', 'year']
+        indexes = [
+            models.Index(fields=['employee', 'leave_type', 'year']),
+        ]
+
+    @property
+    def balance(self):
+        """Returns the current leave balance"""
+        return self.allocated - self.used
+
+    def __str__(self):
+        return f"{self.employee} - {self.leave_type} Balance: {self.balance}"
+

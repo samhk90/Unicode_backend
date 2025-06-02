@@ -1363,5 +1363,94 @@ def get_class_report(request):
             'error': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+@api_view(['GET'])
+def get_class_timetable(request):
+    try:
+        class_id = request.GET.get('class_id')
+        batch_id = request.GET.get('batch_id')
+        
+        if not class_id:
+            return Response({
+                'error': 'class_id is required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Get class information
+        try:
+            class_obj = Classes.objects.select_related('DepartmentID', 'YearID').get(ClassID=class_id)
+        except Classes.DoesNotExist:
+            return Response({
+                'error': 'Class not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        # Build efficient query with prefetch_related
+        timetable_query = (
+            Timetable.objects
+            .select_related(
+                'ClassID',
+                'SlotID',
+                'Batch',
+                'SubjectAssignmentID__TeacherID',
+                'SubjectAssignmentID__SubjectID'
+            )
+            .filter(ClassID=class_id)
+            .order_by('Day', 'SlotID__start_time')
+        )
+
+        if batch_id:
+            timetable_query = timetable_query.filter(Batch_id=batch_id)
+
+        # Get all days of the week
+        days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+        
+        # Structure for weekly timetable
+        weekly_timetable = {day: [] for day in days}
+
+        # Populate timetable data
+        for entry in timetable_query:
+            teacher = entry.SubjectAssignmentID.TeacherID
+            subject = entry.SubjectAssignmentID.SubjectID
+            
+            lecture_data = {
+                'slot': {
+                    'id': entry.SlotID.Slotid,
+                    'start_time': entry.SlotID.get_formatted_start_time(),
+                    'end_time': entry.SlotID.get_formatted_end_time()
+                },
+                'subject': {
+                    'id': subject.SubjectID,
+                    'name': subject.SubjectName,
+                    'type': 'Theory' if subject.SubjectType else 'Practical'
+                },
+                'teacher': {
+                    'id': str(teacher.Teacherid),
+                    'name': f"{teacher.FirstName} {teacher.LastName}",
+                    'department': teacher.DepartmentID.DepartmentName
+                },
+                'batch': entry.Batch.BatchName if entry.Batch else None
+            }
+            
+            weekly_timetable[entry.Day].append(lecture_data)
+
+        # Prepare response data
+        response_data = {
+            'class_info': {
+                'id': class_obj.ClassID,
+                'name': class_obj.ClassName,
+                'department': class_obj.DepartmentID.DepartmentName,
+                'year': class_obj.YearID.YearName
+            },
+            'timetable': weekly_timetable
+        }
+
+        return Response({
+            'message': 'Class timetable fetched successfully',
+            'data': response_data
+        }, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 
