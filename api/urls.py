@@ -22,4 +22,13 @@ urlpatterns = [
     path('notices/<int:notice_id>/delete/', views.delete_notice, name='delete_notice'),
     path('notices/<int:notice_id>/publish/', views.publish_notice, name='publish_notice'),
     path('class-report/', views.get_class_report, name='class_report'),
+
+    # Leave Management URLs
+    path('leave/balance/', views.get_leave_balance, name='leave-balance'),
+    path('leave/applications/', views.get_leave_applications, name='leave-applications'),
+    path('leave/submit/', views.submit_leave_request, name='submit-leave'),
+    path('leave/<int:leave_id>/cancel/', views.cancel_leave_request, name='cancel-leave'),
+    path('leave/<int:leave_id>/', views.get_leave_request_details, name='leave-details'),
+    path('leave/<int:leave_id>/approve/', views.approve_leave_request, name='approve-leave'),
+    path('leave/<int:leave_id>/reject/', views.reject_leave_request, name='reject-leave'),
 ]

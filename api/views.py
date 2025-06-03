@@ -7,10 +7,9 @@ from django.contrib.auth import authenticate, login as auth_login
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 from django.db import models
-from .models import Teacher, Timetable, Student, Slots, Attendance, Classes, Subject, TeacherSubjectAssignment, Notice, NoticeDocument, Results
+from .models import Teacher, Timetable, Student, Slots, Attendance, Classes, Subject, TeacherSubjectAssignment, Notice, NoticeDocument, Results, LeaveRequest, LeaveType, TeacherLeaveBalance
 from django.core.cache import cache
-from django.db.models import Prefetch, F, Count, Q, Avg  # Added Avg import
-
+from django.db.models import Prefetch, F, Count, Q, Avg
 from django.utils import timezone
 import os
 from datetime import datetime, timedelta
@@ -1447,6 +1446,376 @@ def get_class_timetable(request):
             'data': response_data
         }, status=status.HTTP_200_OK)
 
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET'])
+def get_leave_balance(request):
+    try:
+        teacher_id = request.GET.get('teacher_id')
+        if not teacher_id:
+            return Response({
+                'error': 'teacher_id is required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        year = timezone.now().year
+        balances = TeacherLeaveBalance.objects.select_related('leave_type').filter(
+            employee_id=teacher_id,
+            year=year
+        )
+
+        balance_data = {}
+        for balance in balances:
+            balance_data[balance.leave_type.LeaveTypeName.lower()] = {
+                'total': float(balance.allocated),
+                'remaining': float(balance.balance),
+                'used': float(balance.used)
+            }
+
+        return Response({
+            'message': 'Leave balances fetched successfully',
+            'data': balance_data
+        }, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET'])
+def get_leave_applications(request):
+    try:
+        teacher_id = request.GET.get('teacher_id')
+        status_filter = request.GET.get('status')
+        
+        if not teacher_id:
+            return Response({
+                'error': 'teacher_id is required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        leave_requests = LeaveRequest.objects.select_related(
+            'LeaveTypeID',
+            'RequestedTo'
+        ).filter(TeacherID_id=teacher_id)
+
+        if status_filter and status_filter != 'all':
+            leave_requests = leave_requests.filter(Status__iexact=status_filter)
+
+        leave_data = []
+        for leave in leave_requests:
+            leave_data.append({
+                'id': leave.LeaveRequestID,
+                'applicationDate': leave.RequestDate,
+                'leaveType': leave.LeaveTypeID.LeaveTypeName,
+                'fromDate': leave.StartDate,
+                'toDate': leave.EndDate,
+                'days': (leave.EndDate - leave.StartDate).days + 1,
+                'status': leave.Status,
+                'reason': leave.Reason,
+                'requestedTo': f"{leave.RequestedTo.FirstName} {leave.RequestedTo.LastName}",
+                'isApprovedByHOD': leave.is_approvedByHOD,
+                'isApprovedByPrincipal': leave.is_approvedByPrincipal,
+                'hodApprovalDate': leave.HODApprovalDate,
+                'principalApprovalDate': leave.PrincipalApprovalDate
+            })
+
+        return Response({
+            'message': 'Leave applications fetched successfully',
+            'data': leave_data
+        }, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['POST'])
+def submit_leave_request(request):
+    try:
+        teacher_id = request.data.get('teacher_id')
+        leave_type_id = request.data.get('leave_type_id')
+        start_date = request.data.get('from_date')
+        end_date = request.data.get('to_date')
+        reason = request.data.get('reason')
+        requested_to_id = request.data.get('requested_to')
+
+        if not all([teacher_id, leave_type_id, start_date, end_date, reason, requested_to_id]):
+            return Response({
+                'error': 'All fields are required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Convert dates from string to datetime
+        start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+        end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+
+        # Calculate number of days
+        days_count = (end_date - start_date).days + 1
+
+        # Check leave balance
+        year = timezone.now().year
+        leave_balance = TeacherLeaveBalance.objects.get(
+            employee_id=teacher_id,
+            leave_type_id=leave_type_id,
+            year=year
+        )
+
+        if leave_balance.balance < days_count:
+            return Response({
+                'error': f'Insufficient leave balance. Available: {leave_balance.balance}, Required: {days_count}'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Verify that requested_to is HOD of teacher's department
+        teacher = Teacher.objects.select_related('DepartmentID').get(Teacherid=teacher_id)
+        hod = Teacher.objects.select_related('RoleID', 'DepartmentID').get(Teacherid=requested_to_id)
+        
+        if hod.RoleID.RoleName != 'HOD':
+            return Response({
+                'error': 'Leave request must be submitted to HOD first'
+            }, status=status.HTTP_400_BAD_REQUEST)
+            
+        if hod.DepartmentID != teacher.DepartmentID:
+            return Response({
+                'error': 'Leave request must be submitted to HOD of your department'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Create leave request
+        leave_request = LeaveRequest.objects.create(
+            TeacherID_id=teacher_id,
+            LeaveTypeID_id=leave_type_id,
+            StartDate=start_date,
+            EndDate=end_date,
+            Reason=reason,
+            RequestedTo_id=requested_to_id,
+            Status='Pending',
+            is_approvedByHOD=False,
+            is_approvedByPrincipal=False
+        )
+
+        return Response({
+            'message': 'Leave request submitted successfully',
+            'data': {
+                'id': leave_request.LeaveRequestID,
+                'status': leave_request.Status
+            }
+        }, status=status.HTTP_201_CREATED)
+
+    except TeacherLeaveBalance.DoesNotExist:
+        return Response({
+            'error': 'Leave balance not found'
+        }, status=status.HTTP_404_NOT_FOUND)
+    except Teacher.DoesNotExist:
+        return Response({
+            'error': 'Teacher not found'
+        }, status=status.HTTP_404_NOT_FOUND)
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['PUT'])
+def cancel_leave_request(request, leave_id):
+    try:
+        leave_request = LeaveRequest.objects.get(LeaveRequestID=leave_id)
+        
+        if leave_request.Status != 'Pending':
+            return Response({
+                'error': 'Only pending leave requests can be cancelled'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        leave_request.Status = 'Cancelled'
+        leave_request.save()
+
+        return Response({
+            'message': 'Leave request cancelled successfully'
+        }, status=status.HTTP_200_OK)
+
+    except LeaveRequest.DoesNotExist:
+        return Response({
+            'error': 'Leave request not found'
+        }, status=status.HTTP_404_NOT_FOUND)
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET'])
+def get_leave_request_details(request, leave_id):
+    try:
+        leave_request = LeaveRequest.objects.select_related(
+            'TeacherID',
+            'LeaveTypeID',
+            'RequestedTo'
+        ).get(LeaveRequestID=leave_id)
+
+        leave_data = {
+            'id': leave_request.LeaveRequestID,
+            'teacher': {
+                'id': str(leave_request.TeacherID.Teacherid),
+                'name': f"{leave_request.TeacherID.FirstName} {leave_request.TeacherID.LastName}",
+                'department': leave_request.TeacherID.DepartmentID.DepartmentName
+            },
+            'leaveType': leave_request.LeaveTypeID.LeaveTypeName,
+            'startDate': leave_request.StartDate,
+            'endDate': leave_request.EndDate,
+            'reason': leave_request.Reason,
+            'status': leave_request.Status,
+            'requestedTo': {
+                'id': str(leave_request.RequestedTo.Teacherid),
+                'name': f"{leave_request.RequestedTo.FirstName} {leave_request.RequestedTo.LastName}"
+            },
+            'requestDate': leave_request.RequestDate,
+            'isApprovedByHOD': leave_request.is_approvedByHOD,
+            'isApprovedByPrincipal': leave_request.is_approvedByPrincipal,
+            'hodApprovalDate': leave_request.HODApprovalDate,
+            'principalApprovalDate': leave_request.PrincipalApprovalDate
+        }
+
+        return Response({
+            'message': 'Leave request details fetched successfully',
+            'data': leave_data
+        }, status=status.HTTP_200_OK)
+
+    except LeaveRequest.DoesNotExist:
+        return Response({
+            'error': 'Leave request not found'
+        }, status=status.HTTP_404_NOT_FOUND)
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['PUT'])
+def approve_leave_request(request, leave_id):
+    try:
+        teacher_id = request.data.get('teacher_id')  # ID of the approver
+        if not teacher_id:
+            return Response({
+                'error': 'teacher_id is required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Get the leave request with all related data
+        leave_request = LeaveRequest.objects.select_related(
+            'TeacherID',
+            'TeacherID__DepartmentID',
+            'LeaveTypeID',
+            'RequestedTo'
+        ).get(LeaveRequestID=leave_id)
+
+        # Get the approver's role
+        approver = Teacher.objects.select_related('RoleID').get(Teacherid=teacher_id)
+        is_hod = approver.RoleID.RoleName == 'HOD'
+        is_principal = approver.RoleID.RoleName == 'Principal'
+
+        # If it's HOD approval
+        if is_hod and not leave_request.is_approvedByHOD:
+            if leave_request.TeacherID.DepartmentID != approver.DepartmentID:
+                return Response({
+                    'error': 'You can only approve leaves for teachers in your department'
+                }, status=status.HTTP_403_FORBIDDEN)
+
+            leave_request.is_approvedByHOD = True
+            leave_request.HODApprovalDate = timezone.now()
+            leave_request.Status = 'Pending Principal Approval'
+            leave_request.save()
+
+            return Response({
+                'message': 'Leave request approved by HOD successfully'
+            }, status=status.HTTP_200_OK)
+
+        # If it's Principal approval
+        elif is_principal and leave_request.is_approvedByHOD and not leave_request.is_approvedByPrincipal:
+            leave_request.is_approvedByPrincipal = True
+            leave_request.PrincipalApprovalDate = timezone.now()
+            leave_request.Status = 'Approved'
+            
+            # Calculate leave duration
+            days_count = (leave_request.EndDate - leave_request.StartDate).days + 1
+
+            # Update leave balance
+            year = timezone.now().year
+            leave_balance = TeacherLeaveBalance.objects.get(
+                employee_id=leave_request.TeacherID_id,
+                leave_type_id=leave_request.LeaveTypeID_id,
+                year=year
+            )
+            
+            # Update used and balance
+            leave_balance.used = F('used') + days_count
+            leave_balance.save()
+
+            leave_request.save()
+
+            return Response({
+                'message': 'Leave request approved by Principal successfully'
+            }, status=status.HTTP_200_OK)
+
+        else:
+            return Response({
+                'error': 'Invalid approval request or leave request already approved'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+    except LeaveRequest.DoesNotExist:
+        return Response({
+            'error': 'Leave request not found'
+        }, status=status.HTTP_404_NOT_FOUND)
+    except Teacher.DoesNotExist:
+        return Response({
+            'error': 'Teacher not found'
+        }, status=status.HTTP_404_NOT_FOUND)
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['PUT'])
+def reject_leave_request(request, leave_id):
+    try:
+        teacher_id = request.data.get('teacher_id')  # ID of the rejector
+        reason = request.data.get('reason')
+
+        if not teacher_id:
+            return Response({
+                'error': 'teacher_id is required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Get the leave request
+        leave_request = LeaveRequest.objects.select_related(
+            'TeacherID__DepartmentID'
+        ).get(LeaveRequestID=leave_id)
+
+        # Get the rejector's role
+        rejector = Teacher.objects.select_related('RoleID').get(Teacherid=teacher_id)
+        is_hod = rejector.RoleID.RoleName == 'HOD'
+        is_principal = rejector.RoleID.RoleName == 'Principal'
+
+        # Validate authority to reject
+        if is_hod:
+            if leave_request.TeacherID.DepartmentID != rejector.DepartmentID:
+                return Response({
+                    'error': 'You can only reject leaves for teachers in your department'
+                }, status=status.HTTP_403_FORBIDDEN)
+        elif not is_principal:
+            return Response({
+                'error': 'Only HOD or Principal can reject leave requests'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        leave_request.Status = 'Rejected'
+        leave_request.save()
+
+        return Response({
+            'message': 'Leave request rejected successfully'
+        }, status=status.HTTP_200_OK)
+
+    except LeaveRequest.DoesNotExist:
+        return Response({
+            'error': 'Leave request not found'
+        }, status=status.HTTP_404_NOT_FOUND)
+    except Teacher.DoesNotExist:
+        return Response({
+            'error': 'Teacher not found'
+        }, status=status.HTTP_404_NOT_FOUND)
     except Exception as e:
         return Response({
             'error': str(e)
